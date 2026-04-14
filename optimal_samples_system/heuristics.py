@@ -1,0 +1,694 @@
+"""Heuristic solvers and local improvement components."""
+
+from __future__ import annotations
+
+import math
+import random
+import time
+from collections import defaultdict
+from typing import List, Optional, Sequence, Set, Tuple
+
+from .config import LOGGER
+from .instance import CoverageInstance
+from .tracking import CoverageTracker
+
+
+class GreedySolver:
+    def __init__(self, rng: random.Random):
+        self.rng = rng
+
+    def solve(self, instance: CoverageInstance, randomized: bool = False) -> List[int]:
+        tracker = CoverageTracker(instance)
+        remaining = list(range(len(instance.candidates)))
+        solution: List[int] = []
+
+        while not tracker.is_feasible():
+            if randomized:
+                self.rng.shuffle(remaining)
+
+            best_index: Optional[int] = None
+            best_score = (-1, -1)
+
+            for candidate_index in remaining:
+                gain = tracker.marginal_gain(candidate_index)
+                score = (gain, instance.candidate_span(candidate_index))
+                if score > best_score:
+                    best_score = score
+                    best_index = candidate_index
+
+            if best_index is None or best_score[0] <= 0:
+                raise RuntimeError(
+                    "Greedy construction failed to find a candidate with positive gain."
+                )
+
+            tracker.add(best_index)
+            solution.append(best_index)
+            remaining.remove(best_index)
+
+        return solution
+
+
+class RedundancyEliminator:
+    def eliminate(self, instance: CoverageInstance, solution: Sequence[int]) -> List[int]:
+        tracker = CoverageTracker(instance)
+        tracker.reset(solution)
+
+        changed = True
+        while changed:
+            changed = False
+            ordered = sorted(
+                tracker.in_solution,
+                key=lambda candidate_index: (
+                    tracker.exclusive_count(candidate_index),
+                    tracker.redundancy_score(candidate_index),
+                ),
+            )
+            for candidate_index in ordered:
+                if tracker.can_remove(candidate_index):
+                    tracker.remove(candidate_index)
+                    changed = True
+                    break
+
+        return sorted(tracker.in_solution)
+
+
+class ImprovedNeuralNet:
+    def __init__(
+        self,
+        rng: random.Random,
+        input_dim: int = 12,
+        hidden1: int = 32,
+        hidden2: int = 16,
+        learning_rate: float = 0.005,
+    ):
+        self.rng = rng
+        self.input_dim = input_dim
+        self.lr = learning_rate
+
+        self.W1 = self._xavier(input_dim, hidden1)
+        self.b1 = [0.0] * hidden1
+        self.W2 = self._xavier(hidden1, hidden2)
+        self.b2 = [0.0] * hidden2
+        self.W3 = self._xavier(hidden2, 1)
+        self.b3 = [0.0]
+
+        self.positive_buffer: List[Tuple[List[float], float]] = []
+        self.negative_buffer: List[Tuple[List[float], float]] = []
+        self.buffer_max = 500
+        self.batch_size = 20
+        self.train_count = 0
+
+        self.feat_sum = [0.0] * input_dim
+        self.feat_sq_sum = [0.0] * input_dim
+        self.feat_count = 0
+
+    def _xavier(self, fan_in: int, fan_out: int) -> List[List[float]]:
+        limit = math.sqrt(6.0 / (fan_in + fan_out))
+        return [
+            [self.rng.uniform(-limit, limit) for _ in range(fan_out)]
+            for _ in range(fan_in)
+        ]
+
+    def _update_stats(self, features: Sequence[float]) -> None:
+        for index, value in enumerate(features):
+            self.feat_sum[index] += value
+            self.feat_sq_sum[index] += value * value
+        self.feat_count += 1
+
+    def _normalize(self, features: Sequence[float]) -> List[float]:
+        if self.feat_count < 10:
+            return list(features)
+
+        normalized = []
+        for index in range(self.input_dim):
+            mean = self.feat_sum[index] / self.feat_count
+            variance = self.feat_sq_sum[index] / self.feat_count - mean * mean
+            std = math.sqrt(max(variance, 1e-8))
+            normalized.append((features[index] - mean) / std)
+        return normalized
+
+    @staticmethod
+    def _lrelu(value: float) -> float:
+        return value if value > 0 else 0.01 * value
+
+    @staticmethod
+    def _lrelu_d(value: float) -> float:
+        return 1.0 if value > 0 else 0.01
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        clipped = max(-500.0, min(500.0, value))
+        return 1.0 / (1.0 + math.exp(-clipped))
+
+    def forward(
+        self, raw_features: Sequence[float]
+    ) -> Tuple[
+        float,
+        Tuple[List[float], List[float], List[float], List[float], List[float], float, float],
+    ]:
+        features = self._normalize(raw_features)
+        h1_pre = [
+            self.b1[j]
+            + sum(features[i] * self.W1[i][j] for i in range(self.input_dim))
+            for j in range(len(self.b1))
+        ]
+        h1 = [self._lrelu(value) for value in h1_pre]
+
+        h2_pre = [
+            self.b2[j] + sum(h1[i] * self.W2[i][j] for i in range(len(h1)))
+            for j in range(len(self.b2))
+        ]
+        h2 = [self._lrelu(value) for value in h2_pre]
+
+        out_pre = self.b3[0] + sum(h2[i] * self.W3[i][0] for i in range(len(h2)))
+        out = self._sigmoid(out_pre)
+        cache = (features, h1_pre, h1, h2_pre, h2, out_pre, out)
+        return out, cache
+
+    def backward(
+        self,
+        cache: Tuple[List[float], List[float], List[float], List[float], List[float], float, float],
+        label: float,
+    ) -> None:
+        features, h1_pre, h1, h2_pre, h2, _, out = cache
+
+        old_W2 = [row[:] for row in self.W2]
+        old_W3 = [row[0] for row in self.W3]
+
+        delta_out = out - label
+        for i in range(len(h2)):
+            self.W3[i][0] -= self.lr * delta_out * h2[i]
+        self.b3[0] -= self.lr * delta_out
+
+        delta_h2 = [
+            delta_out * old_W3[i] * self._lrelu_d(h2_pre[i]) for i in range(len(h2))
+        ]
+
+        for i in range(len(h1)):
+            for j in range(len(delta_h2)):
+                self.W2[i][j] -= self.lr * delta_h2[j] * h1[i]
+        for j in range(len(delta_h2)):
+            self.b2[j] -= self.lr * delta_h2[j]
+
+        delta_h1 = [
+            sum(delta_h2[j] * old_W2[i][j] for j in range(len(delta_h2)))
+            * self._lrelu_d(h1_pre[i])
+            for i in range(len(h1))
+        ]
+
+        for i in range(self.input_dim):
+            for j in range(len(delta_h1)):
+                self.W1[i][j] -= self.lr * delta_h1[j] * features[i]
+        for j in range(len(delta_h1)):
+            self.b1[j] -= self.lr * delta_h1[j]
+
+    def add_sample(self, features: Sequence[float], label: float) -> None:
+        feature_list = list(features)
+        self._update_stats(feature_list)
+        buffer = self.positive_buffer if label > 0.5 else self.negative_buffer
+        buffer.append((feature_list, label))
+        if len(buffer) > self.buffer_max:
+            buffer.pop(0)
+
+        total = len(self.positive_buffer) + len(self.negative_buffer)
+        if total >= self.batch_size:
+            self._train_batch()
+
+    def _train_batch(self) -> None:
+        num_positive = min(len(self.positive_buffer), self.batch_size // 2)
+        num_negative = min(len(self.negative_buffer), self.batch_size - num_positive)
+
+        batch: List[Tuple[List[float], float]] = []
+        if num_positive > 0:
+            batch.extend(self.rng.sample(self.positive_buffer, num_positive))
+        if num_negative > 0:
+            batch.extend(self.rng.sample(self.negative_buffer, num_negative))
+
+        self.rng.shuffle(batch)
+        for features, label in batch:
+            _, cache = self.forward(features)
+            self.backward(cache, label)
+        self.train_count += 1
+
+    def predict(self, features: Sequence[float]) -> float:
+        if self.train_count == 0:
+            return 0.5
+        probability, _ = self.forward(features)
+        return probability
+
+
+class FeatureExtractor:
+    def __init__(self, instance: CoverageInstance, greedy_size: int):
+        self.instance = instance
+        self.greedy_size = greedy_size
+        self.total_targets = len(instance.targets)
+        self.total_subsets = len(instance.s_subsets)
+        self.max_subsets_per_candidate = math.comb(instance.k, instance.s)
+        self.total_required_units = (
+            len(instance.targets) * max(1, instance.required_subset_count)
+        )
+
+    def extract_remove(
+        self, tracker: CoverageTracker, candidate_index: int, step: int, total_steps: int
+    ) -> List[float]:
+        return [
+            tracker.exclusive_count(candidate_index) / max(1, self.total_targets),
+            1.0 if tracker.can_remove(candidate_index) else 0.0,
+            tracker.redundancy_score(candidate_index)
+            / max(1.0, float(self.instance.required_subset_count)),
+            self.instance.candidate_span(candidate_index) / max(1, self.total_targets),
+            len(self.instance.candidate_subset_ids(candidate_index))
+            / max(1, self.max_subsets_per_candidate),
+            tracker.new_subset_gain(candidate_index) / max(1, self.total_subsets),
+            tracker.solution_size / max(1, self.greedy_size),
+            step / max(1, total_steps),
+            tracker.unsatisfied_targets / max(1, self.total_targets),
+            tracker.deficit_units / max(1, self.total_required_units),
+            0.0,
+            self.instance.required_subset_count
+            / max(1, self.instance.total_s_subsets_per_target),
+        ]
+
+    def extract_replace(
+        self,
+        tracker: CoverageTracker,
+        candidate_remove: int,
+        candidate_add: int,
+        step: int,
+        total_steps: int,
+    ) -> List[float]:
+        newly_uncovered = tracker.get_newly_uncovered(candidate_remove)
+        impacted = set(self.instance.candidate_impacted_targets(candidate_add))
+        recovered_targets = len(newly_uncovered & impacted)
+        overlap = self.instance.candidate_overlap_in_s_subsets(
+            candidate_remove, candidate_add
+        )
+
+        return [
+            tracker.exclusive_count(candidate_remove) / max(1, self.total_targets),
+            recovered_targets / max(1, len(newly_uncovered)),
+            tracker.marginal_gain(candidate_add) / max(1, self.total_required_units),
+            overlap / max(1, self.max_subsets_per_candidate),
+            self.instance.candidate_span(candidate_add) / max(1, self.total_targets),
+            tracker.redundancy_score(candidate_remove)
+            / max(1.0, float(self.instance.required_subset_count)),
+            tracker.solution_size / max(1, self.greedy_size),
+            step / max(1, total_steps),
+            tracker.unsatisfied_targets / max(1, self.total_targets),
+            tracker.deficit_units / max(1, self.total_required_units),
+            1.0,
+            len(newly_uncovered) / max(1, self.total_targets),
+        ]
+
+
+class ImprovedLocalSearch:
+    def __init__(
+        self,
+        instance: CoverageInstance,
+        initial_solution: Sequence[int],
+        rng: random.Random,
+        max_steps: int = 2000,
+        warmup: int = 200,
+        candidate_sample_size: int = 48,
+        use_neural_guidance: bool = True,
+    ):
+        self.instance = instance
+        self.initial_solution = list(initial_solution)
+        self.rng = rng
+        self.max_steps = max_steps
+        self.warmup = warmup
+        self.candidate_sample_size = candidate_sample_size
+        self.use_neural_guidance = use_neural_guidance
+        self.nn = ImprovedNeuralNet(rng=self.rng, input_dim=12)
+        self.feat = FeatureExtractor(instance, max(1, len(initial_solution)))
+        self.stats = defaultdict(int)
+
+    def solve(self) -> List[int]:
+        start = time.time()
+        cleaned = RedundancyEliminator().eliminate(self.instance, self.initial_solution)
+        LOGGER.info(
+            f"  Redundancy elimination: {len(self.initial_solution)} -> {len(cleaned)}"
+        )
+
+        tracker = CoverageTracker(self.instance)
+        tracker.reset(cleaned)
+        best = list(sorted(tracker.in_solution))
+        best_size = len(best)
+
+        for step in range(self.max_steps):
+            use_nn = (
+                self.use_neural_guidance
+                and step >= self.warmup
+                and self.nn.train_count >= 3
+                and self.rng.random() > 0.15
+            )
+            improved = False
+
+            if self.rng.random() < 0.45:
+                improved = self._try_remove(tracker, step, use_nn)
+            if not improved and self.rng.random() < 0.55:
+                improved = self._try_replace(tracker, step, use_nn)
+            if not improved and self.rng.random() < 0.30:
+                improved = self._try_remove_repair(tracker, step)
+
+            if improved and tracker.solution_size < best_size:
+                best = list(sorted(tracker.in_solution))
+                best_size = len(best)
+                label = "NN" if use_nn else "search"
+                LOGGER.info(f"  Step {step}: new best {best_size} ({label})")
+
+            if (step + 1) % 1000 == 0:
+                LOGGER.info(
+                    f"  Progress {step + 1}/{self.max_steps}, best {best_size}, "
+                    f"NN batches {self.nn.train_count}"
+                )
+
+        elapsed = time.time() - start
+        LOGGER.info(
+            f"  Local search: {len(self.initial_solution)} -> {best_size}, "
+            f"time {elapsed:.2f}s, improvements {self.stats['improvements']}"
+        )
+        return best
+
+    def _strip_redundancy(self, tracker: CoverageTracker) -> int:
+        removed = 0
+        changed = True
+        while changed:
+            changed = False
+            ordered = sorted(
+                tracker.in_solution,
+                key=lambda candidate_index: (
+                    tracker.exclusive_count(candidate_index),
+                    tracker.redundancy_score(candidate_index),
+                ),
+            )
+            for candidate_index in ordered:
+                if tracker.can_remove(candidate_index):
+                    tracker.remove(candidate_index)
+                    removed += 1
+                    changed = True
+                    break
+        return removed
+
+    def _sample_outside_candidates(self, tracker: CoverageTracker) -> List[int]:
+        outside = [
+            candidate_index
+            for candidate_index in range(len(self.instance.candidates))
+            if candidate_index not in tracker.in_solution
+        ]
+        if len(outside) <= self.candidate_sample_size:
+            return outside
+        return self.rng.sample(outside, self.candidate_sample_size)
+
+    def _try_remove(self, tracker: CoverageTracker, step: int, use_nn: bool) -> bool:
+        candidates = []
+        for candidate_index in tracker.in_solution:
+            features = self.feat.extract_remove(
+                tracker, candidate_index, step, self.max_steps
+            )
+            score = (
+                self.nn.predict(features)
+                if use_nn
+                else -tracker.exclusive_count(candidate_index)
+            )
+            candidates.append((score, candidate_index, features))
+
+        if not candidates:
+            return False
+
+        candidates.sort(reverse=True)
+        _, candidate_index, features = candidates[0]
+
+        if tracker.can_remove(candidate_index):
+            tracker.remove(candidate_index)
+            self.nn.add_sample(features, 1.0)
+            self.stats["improvements"] += 1
+            return True
+
+        self.nn.add_sample(features, 0.0)
+        return False
+
+    def _try_replace(self, tracker: CoverageTracker, step: int, use_nn: bool) -> bool:
+        if not tracker.in_solution:
+            return False
+
+        remove_pool = sorted(
+            tracker.in_solution,
+            key=lambda candidate_index: tracker.exclusive_count(candidate_index),
+        )[: min(6, len(tracker.in_solution))]
+        add_pool = self._sample_outside_candidates(tracker)
+        if not add_pool:
+            return False
+
+        best_pair: Optional[Tuple[int, int, List[float]]] = None
+        best_score = float("-inf")
+
+        for candidate_remove in remove_pool:
+            for candidate_add in add_pool:
+                features = self.feat.extract_replace(
+                    tracker, candidate_remove, candidate_add, step, self.max_steps
+                )
+                score = (
+                    self.nn.predict(features)
+                    if use_nn
+                    else tracker.marginal_gain(candidate_add)
+                    - tracker.exclusive_count(candidate_remove)
+                )
+                if score > best_score:
+                    best_score = score
+                    best_pair = (candidate_remove, candidate_add, features)
+
+        if best_pair is None:
+            return False
+
+        candidate_remove, candidate_add, features = best_pair
+        snapshot = list(tracker.in_solution)
+        size_before = tracker.solution_size
+
+        tracker.remove(candidate_remove)
+        tracker.add(candidate_add)
+        self._strip_redundancy(tracker)
+
+        if tracker.is_feasible() and tracker.solution_size < size_before:
+            self.nn.add_sample(features, 1.0)
+            self.stats["improvements"] += 1
+            return True
+
+        tracker.reset(snapshot)
+        self.nn.add_sample(features, 0.0)
+        return False
+
+    def _try_remove_repair(self, tracker: CoverageTracker, step: int) -> bool:
+        _ = step
+        ordered = sorted(
+            tracker.in_solution,
+            key=lambda candidate_index: tracker.exclusive_count(candidate_index),
+        )
+        for candidate_remove in ordered[: min(5, len(ordered))]:
+            snapshot = list(tracker.in_solution)
+            size_before = tracker.solution_size
+            tracker.remove(candidate_remove)
+
+            if tracker.is_feasible():
+                self.stats["improvements"] += 1
+                return True
+
+            add_pool = self._sample_outside_candidates(tracker)
+            if not add_pool:
+                tracker.reset(snapshot)
+                continue
+
+            candidate_add = max(add_pool, key=tracker.marginal_gain)
+            tracker.add(candidate_add)
+            self._strip_redundancy(tracker)
+
+            if tracker.is_feasible() and tracker.solution_size < size_before:
+                self.stats["improvements"] += 1
+                return True
+
+            tracker.reset(snapshot)
+
+        return False
+
+
+class ImprovedSA:
+    def __init__(
+        self,
+        instance: CoverageInstance,
+        initial_solution: Sequence[int],
+        rng: random.Random,
+        T_start: float = 5.0,
+        T_end: float = 0.001,
+        max_iter: int = 4000,
+    ):
+        self.instance = instance
+        self.initial_solution = list(initial_solution)
+        self.rng = rng
+        self.T_start = T_start
+        self.T_end = T_end
+        self.max_iter = max_iter
+        self.penalty = max(10, len(initial_solution))
+
+    def _cost(self, tracker: CoverageTracker) -> int:
+        return tracker.solution_size + self.penalty * tracker.deficit_units
+
+    def solve(self) -> List[int]:
+        start = time.time()
+        tracker = CoverageTracker(self.instance)
+        tracker.reset(self.initial_solution)
+        best = list(sorted(tracker.in_solution))
+        current_cost = self._cost(tracker)
+
+        temperature = self.T_start
+        cooling = (self.T_end / self.T_start) ** (1.0 / max(1, self.max_iter))
+        outside = set(range(len(self.instance.candidates))) - tracker.in_solution
+        no_improve = 0
+
+        for iteration in range(self.max_iter):
+            temperature *= cooling
+            draw = self.rng.random()
+            if draw < 0.35:
+                move = self._move_remove(tracker, outside)
+            elif draw < 0.70:
+                move = self._move_replace(tracker, outside)
+            elif draw < 0.90:
+                move = self._move_swap2(tracker, outside)
+            else:
+                move = self._move_add_remove2(tracker, outside)
+
+            if move is None:
+                continue
+
+            new_cost = self._cost(tracker)
+            delta = new_cost - current_cost
+
+            if delta <= 0 or self.rng.random() < math.exp(-delta / max(temperature, 1e-10)):
+                current_cost = new_cost
+                no_improve = 0
+                if tracker.is_feasible() and tracker.solution_size < len(best):
+                    best = list(sorted(tracker.in_solution))
+                    LOGGER.info(
+                        f"  SA iteration {iteration}: new best {len(best)} "
+                        f"(T={temperature:.4f})"
+                    )
+            else:
+                self._undo(tracker, move, outside)
+                no_improve += 1
+
+            if no_improve > 500:
+                temperature = min(temperature * 5.0, self.T_start)
+                no_improve = 0
+
+        elapsed = time.time() - start
+        LOGGER.info(
+            f"  Simulated annealing: {len(self.initial_solution)} -> {len(best)}, "
+            f"time {elapsed:.2f}s"
+        )
+        return best
+
+    def _move_remove(
+        self, tracker: CoverageTracker, outside: Set[int]
+    ) -> Optional[Tuple[str, int]]:
+        solution = list(tracker.in_solution)
+        if len(solution) <= 1:
+            return None
+        candidate_index = self.rng.choice(solution)
+        tracker.remove(candidate_index)
+        outside.add(candidate_index)
+        return ("remove", candidate_index)
+
+    def _move_replace(
+        self, tracker: CoverageTracker, outside: Set[int]
+    ) -> Optional[Tuple[str, int, int]]:
+        solution = list(tracker.in_solution)
+        non_solution = list(outside)
+        if not solution or not non_solution:
+            return None
+
+        remove_index = self.rng.choice(solution)
+        add_index = self.rng.choice(non_solution)
+        tracker.remove(remove_index)
+        tracker.add(add_index)
+        outside.add(remove_index)
+        outside.discard(add_index)
+        return ("replace", remove_index, add_index)
+
+    def _move_swap2(
+        self, tracker: CoverageTracker, outside: Set[int]
+    ) -> Optional[Tuple[str, List[int], int]]:
+        solution = list(tracker.in_solution)
+        non_solution = list(outside)
+        if len(solution) < 3 or not non_solution:
+            return None
+
+        removed = self.rng.sample(solution, 2)
+        added = self.rng.choice(non_solution)
+        for candidate_index in removed:
+            tracker.remove(candidate_index)
+            outside.add(candidate_index)
+        tracker.add(added)
+        outside.discard(added)
+        return ("swap2", removed, added)
+
+    def _move_add_remove2(
+        self, tracker: CoverageTracker, outside: Set[int]
+    ) -> Optional[Tuple[str, List[int], int]]:
+        solution = list(tracker.in_solution)
+        non_solution = list(outside)
+        if len(solution) < 3 or not non_solution:
+            return None
+
+        added = self.rng.choice(non_solution)
+        tracker.add(added)
+        outside.discard(added)
+
+        removable = sorted(
+            [candidate_index for candidate_index in tracker.in_solution if candidate_index != added],
+            key=lambda candidate_index: tracker.exclusive_count(candidate_index),
+        )
+        removed = removable[:2]
+        for candidate_index in removed:
+            tracker.remove(candidate_index)
+            outside.add(candidate_index)
+        return ("add_remove2", removed, added)
+
+    def _undo(
+        self,
+        tracker: CoverageTracker,
+        move: Tuple[object, ...],
+        outside: Set[int],
+    ) -> None:
+        move_type = move[0]
+        if move_type == "remove":
+            candidate_index = int(move[1])
+            tracker.add(candidate_index)
+            outside.discard(candidate_index)
+            return
+
+        if move_type == "replace":
+            remove_index = int(move[1])
+            add_index = int(move[2])
+            tracker.remove(add_index)
+            tracker.add(remove_index)
+            outside.discard(remove_index)
+            outside.add(add_index)
+            return
+
+        if move_type == "swap2":
+            removed = list(move[1])
+            added = int(move[2])
+            tracker.remove(added)
+            outside.add(added)
+            for candidate_index in removed:
+                tracker.add(candidate_index)
+                outside.discard(candidate_index)
+            return
+
+        if move_type == "add_remove2":
+            removed = list(move[1])
+            added = int(move[2])
+            for candidate_index in removed:
+                tracker.add(candidate_index)
+                outside.discard(candidate_index)
+            tracker.remove(added)
+            outside.add(added)
