@@ -60,17 +60,19 @@ class CoverageInstance:
                 self.subset_to_targets[subset_id].append(target_index)
         self.subset_to_targets = [tuple(indices) for indices in self.subset_to_targets]
 
+        self.covers: Optional[List[Set[int]]] = None
+        self.covered_by: Optional[List[Set[int]]] = None
+        if self.aggregation_mode == AggregationMode.SINGLE_CANDIDATE:
+            self._build_single_candidate_cover_relation()
+
+        # 优化6: 构造时全量预计算两个高频缓存，消除运行时 None 检查开销
         self._candidate_subset_cache: List[Optional[Tuple[int, ...]]] = [
             None
         ] * len(self.position_candidates)
         self._candidate_impacted_targets_cache: List[Optional[Tuple[int, ...]]] = [
             None
         ] * len(self.position_candidates)
-
-        self.covers: Optional[List[Set[int]]] = None
-        self.covered_by: Optional[List[Set[int]]] = None
-        if self.aggregation_mode == AggregationMode.SINGLE_CANDIDATE:
-            self._build_single_candidate_cover_relation()
+        self._precompute_caches()
 
         LOGGER.info(self.summary())
 
@@ -83,6 +85,13 @@ class CoverageInstance:
         for position in positions:
             mask |= 1 << position
         return mask
+
+    def _precompute_caches(self) -> None:
+        """优化6: 构造时批量预计算所有候选的 subset_ids 和 impacted_targets，
+        消除求解过程中的逐步懒加载开销。"""
+        for candidate_index in range(len(self.position_candidates)):
+            self.candidate_subset_ids(candidate_index)
+            self.candidate_impacted_targets(candidate_index)
 
     def _build_single_candidate_cover_relation(self) -> None:
         pair_count = len(self.position_candidates) * len(self.position_targets)

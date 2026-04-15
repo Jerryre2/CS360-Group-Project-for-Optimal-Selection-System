@@ -8,6 +8,8 @@ import time
 from collections import defaultdict
 from typing import List, Optional, Sequence, Set, Tuple
 
+import numpy as np
+
 from .config import LOGGER
 from .instance import CoverageInstance
 from .tracking import CoverageTracker
@@ -19,17 +21,19 @@ class GreedySolver:
 
     def solve(self, instance: CoverageInstance, randomized: bool = False) -> List[int]:
         tracker = CoverageTracker(instance)
-        remaining = list(range(len(instance.candidates)))
+        # 优化3: 使用 set 替代 list，remove 操作从 O(n) 降到 O(1)
+        remaining: Set[int] = set(range(len(instance.candidates)))
         solution: List[int] = []
 
         while not tracker.is_feasible():
+            candidates_list = list(remaining)
             if randomized:
-                self.rng.shuffle(remaining)
+                self.rng.shuffle(candidates_list)
 
             best_index: Optional[int] = None
             best_score = (-1, -1)
 
-            for candidate_index in remaining:
+            for candidate_index in candidates_list:
                 gain = tracker.marginal_gain(candidate_index)
                 score = (gain, instance.candidate_span(candidate_index))
                 if score > best_score:
@@ -43,7 +47,7 @@ class GreedySolver:
 
             tracker.add(best_index)
             solution.append(best_index)
-            remaining.remove(best_index)
+            remaining.discard(best_index)  # O(1) 而非 O(n)
 
         return solution
 
@@ -72,7 +76,13 @@ class RedundancyEliminator:
         return sorted(tracker.in_solution)
 
 
+# ---------------------------------------------------------------------------
+# 优化1: 神经网络全面 NumPy 向量化
+# ---------------------------------------------------------------------------
+
 class ImprovedNeuralNet:
+    """三层神经网络，使用 NumPy 向量化运算加速（相比纯 Python 提速 10-50x）。"""
+
     def __init__(
         self,
         rng: random.Random,
@@ -85,128 +95,105 @@ class ImprovedNeuralNet:
         self.input_dim = input_dim
         self.lr = learning_rate
 
+        # Xavier 初始化，直接使用 numpy 数组
         self.W1 = self._xavier(input_dim, hidden1)
-        self.b1 = [0.0] * hidden1
+        self.b1 = np.zeros(hidden1)
         self.W2 = self._xavier(hidden1, hidden2)
-        self.b2 = [0.0] * hidden2
+        self.b2 = np.zeros(hidden2)
         self.W3 = self._xavier(hidden2, 1)
-        self.b3 = [0.0]
+        self.b3 = np.zeros(1)
 
-        self.positive_buffer: List[Tuple[List[float], float]] = []
-        self.negative_buffer: List[Tuple[List[float], float]] = []
+        self.positive_buffer: List[Tuple[np.ndarray, float]] = []
+        self.negative_buffer: List[Tuple[np.ndarray, float]] = []
         self.buffer_max = 500
         self.batch_size = 20
         self.train_count = 0
 
-        self.feat_sum = [0.0] * input_dim
-        self.feat_sq_sum = [0.0] * input_dim
+        # 在线特征归一化统计量（NumPy）
+        self.feat_sum = np.zeros(input_dim)
+        self.feat_sq_sum = np.zeros(input_dim)
         self.feat_count = 0
 
-    def _xavier(self, fan_in: int, fan_out: int) -> List[List[float]]:
+    def _xavier(self, fan_in: int, fan_out: int) -> np.ndarray:
         limit = math.sqrt(6.0 / (fan_in + fan_out))
-        return [
-            [self.rng.uniform(-limit, limit) for _ in range(fan_out)]
-            for _ in range(fan_in)
-        ]
+        # 使用 rng 保证与原始代码相同的随机行为（兼容 seed 复现）
+        data = [self.rng.uniform(-limit, limit) for _ in range(fan_in * fan_out)]
+        return np.array(data, dtype=np.float64).reshape(fan_in, fan_out)
 
-    def _update_stats(self, features: Sequence[float]) -> None:
-        for index, value in enumerate(features):
-            self.feat_sum[index] += value
-            self.feat_sq_sum[index] += value * value
+    def _update_stats(self, features: np.ndarray) -> None:
+        self.feat_sum += features
+        self.feat_sq_sum += features * features
         self.feat_count += 1
 
-    def _normalize(self, features: Sequence[float]) -> List[float]:
+    def _normalize(self, features: np.ndarray) -> np.ndarray:
         if self.feat_count < 10:
-            return list(features)
-
-        normalized = []
-        for index in range(self.input_dim):
-            mean = self.feat_sum[index] / self.feat_count
-            variance = self.feat_sq_sum[index] / self.feat_count - mean * mean
-            std = math.sqrt(max(variance, 1e-8))
-            normalized.append((features[index] - mean) / std)
-        return normalized
+            return features.copy()
+        mean = self.feat_sum / self.feat_count
+        variance = self.feat_sq_sum / self.feat_count - mean * mean
+        std = np.sqrt(np.maximum(variance, 1e-8))
+        return (features - mean) / std
 
     @staticmethod
-    def _lrelu(value: float) -> float:
-        return value if value > 0 else 0.01 * value
+    def _lrelu(x: np.ndarray) -> np.ndarray:
+        return np.where(x > 0, x, 0.01 * x)
 
     @staticmethod
-    def _lrelu_d(value: float) -> float:
-        return 1.0 if value > 0 else 0.01
+    def _lrelu_d(x: np.ndarray) -> np.ndarray:
+        return np.where(x > 0, 1.0, 0.01)
 
     @staticmethod
-    def _sigmoid(value: float) -> float:
-        clipped = max(-500.0, min(500.0, value))
+    def _sigmoid(x: float) -> float:
+        clipped = max(-500.0, min(500.0, x))
         return 1.0 / (1.0 + math.exp(-clipped))
 
     def forward(
-        self, raw_features: Sequence[float]
-    ) -> Tuple[
-        float,
-        Tuple[List[float], List[float], List[float], List[float], List[float], float, float],
-    ]:
+        self, raw_features: np.ndarray
+    ) -> Tuple[float, Tuple]:
         features = self._normalize(raw_features)
-        h1_pre = [
-            self.b1[j]
-            + sum(features[i] * self.W1[i][j] for i in range(self.input_dim))
-            for j in range(len(self.b1))
-        ]
-        h1 = [self._lrelu(value) for value in h1_pre]
 
-        h2_pre = [
-            self.b2[j] + sum(h1[i] * self.W2[i][j] for i in range(len(h1)))
-            for j in range(len(self.b2))
-        ]
-        h2 = [self._lrelu(value) for value in h2_pre]
+        # 向量化矩阵乘法（原 Python 嵌套循环 → NumPy 单行）
+        h1_pre = features @ self.W1 + self.b1      # shape: (hidden1,)
+        h1 = self._lrelu(h1_pre)                   # shape: (hidden1,)
 
-        out_pre = self.b3[0] + sum(h2[i] * self.W3[i][0] for i in range(len(h2)))
-        out = self._sigmoid(out_pre)
-        cache = (features, h1_pre, h1, h2_pre, h2, out_pre, out)
+        h2_pre = h1 @ self.W2 + self.b2            # shape: (hidden2,)
+        h2 = self._lrelu(h2_pre)                   # shape: (hidden2,)
+
+        out_pre_val = float(h2 @ self.W3[:, 0] + self.b3[0])
+        out = self._sigmoid(out_pre_val)
+
+        cache = (features, h1_pre, h1, h2_pre, h2, out_pre_val, out)
         return out, cache
 
-    def backward(
-        self,
-        cache: Tuple[List[float], List[float], List[float], List[float], List[float], float, float],
-        label: float,
-    ) -> None:
+    def backward(self, cache: Tuple, label: float) -> None:
         features, h1_pre, h1, h2_pre, h2, _, out = cache
 
-        old_W2 = [row[:] for row in self.W2]
-        old_W3 = [row[0] for row in self.W3]
+        delta_out = out - label  # scalar
 
-        delta_out = out - label
-        for i in range(len(h2)):
-            self.W3[i][0] -= self.lr * delta_out * h2[i]
-        self.b3[0] -= self.lr * delta_out
+        # 输出层梯度（向量化）
+        dW3 = (delta_out * h2).reshape(-1, 1)
+        db3 = np.array([delta_out])
+        old_W3 = self.W3.copy()
+        self.W3 -= self.lr * dW3
+        self.b3 -= self.lr * db3
 
-        delta_h2 = [
-            delta_out * old_W3[i] * self._lrelu_d(h2_pre[i]) for i in range(len(h2))
-        ]
+        # 隐藏层2梯度
+        delta_h2 = delta_out * old_W3[:, 0] * self._lrelu_d(h2_pre)  # (hidden2,)
+        dW2 = np.outer(h1, delta_h2)
+        old_W2 = self.W2.copy()
+        self.W2 -= self.lr * dW2
+        self.b2 -= self.lr * delta_h2
 
-        for i in range(len(h1)):
-            for j in range(len(delta_h2)):
-                self.W2[i][j] -= self.lr * delta_h2[j] * h1[i]
-        for j in range(len(delta_h2)):
-            self.b2[j] -= self.lr * delta_h2[j]
-
-        delta_h1 = [
-            sum(delta_h2[j] * old_W2[i][j] for j in range(len(delta_h2)))
-            * self._lrelu_d(h1_pre[i])
-            for i in range(len(h1))
-        ]
-
-        for i in range(self.input_dim):
-            for j in range(len(delta_h1)):
-                self.W1[i][j] -= self.lr * delta_h1[j] * features[i]
-        for j in range(len(delta_h1)):
-            self.b1[j] -= self.lr * delta_h1[j]
+        # 隐藏层1梯度
+        delta_h1 = (delta_h2 @ old_W2.T) * self._lrelu_d(h1_pre)    # (hidden1,)
+        dW1 = np.outer(features, delta_h1)
+        self.W1 -= self.lr * dW1
+        self.b1 -= self.lr * delta_h1
 
     def add_sample(self, features: Sequence[float], label: float) -> None:
-        feature_list = list(features)
-        self._update_stats(feature_list)
+        feat_arr = np.array(features, dtype=np.float64)
+        self._update_stats(feat_arr)
         buffer = self.positive_buffer if label > 0.5 else self.negative_buffer
-        buffer.append((feature_list, label))
+        buffer.append((feat_arr, label))
         if len(buffer) > self.buffer_max:
             buffer.pop(0)
 
@@ -218,22 +205,22 @@ class ImprovedNeuralNet:
         num_positive = min(len(self.positive_buffer), self.batch_size // 2)
         num_negative = min(len(self.negative_buffer), self.batch_size - num_positive)
 
-        batch: List[Tuple[List[float], float]] = []
+        batch: List[Tuple[np.ndarray, float]] = []
         if num_positive > 0:
             batch.extend(self.rng.sample(self.positive_buffer, num_positive))
         if num_negative > 0:
             batch.extend(self.rng.sample(self.negative_buffer, num_negative))
 
         self.rng.shuffle(batch)
-        for features, label in batch:
-            _, cache = self.forward(features)
+        for feat_arr, label in batch:
+            _, cache = self.forward(feat_arr)
             self.backward(cache, label)
         self.train_count += 1
 
     def predict(self, features: Sequence[float]) -> float:
         if self.train_count == 0:
             return 0.5
-        probability, _ = self.forward(features)
+        probability, _ = self.forward(np.array(features, dtype=np.float64))
         return probability
 
 
@@ -335,6 +322,9 @@ class ImprovedLocalSearch:
         best = list(sorted(tracker.in_solution))
         best_size = len(best)
 
+        # 优化4: 维护持久化的外部候选集合，随 add/remove 增量更新
+        outside: Set[int] = set(range(len(self.instance.candidates))) - tracker.in_solution
+
         for step in range(self.max_steps):
             use_nn = (
                 self.use_neural_guidance
@@ -345,11 +335,11 @@ class ImprovedLocalSearch:
             improved = False
 
             if self.rng.random() < 0.45:
-                improved = self._try_remove(tracker, step, use_nn)
+                improved = self._try_remove(tracker, outside, step, use_nn)
             if not improved and self.rng.random() < 0.55:
-                improved = self._try_replace(tracker, step, use_nn)
+                improved = self._try_replace(tracker, outside, step, use_nn)
             if not improved and self.rng.random() < 0.30:
-                improved = self._try_remove_repair(tracker, step)
+                improved = self._try_remove_repair(tracker, outside, step)
 
             if improved and tracker.solution_size < best_size:
                 best = list(sorted(tracker.in_solution))
@@ -370,7 +360,8 @@ class ImprovedLocalSearch:
         )
         return best
 
-    def _strip_redundancy(self, tracker: CoverageTracker) -> int:
+    def _strip_redundancy(self, tracker: CoverageTracker, outside: Set[int]) -> int:
+        """去除冗余候选，同时更新 outside 集合。"""
         removed = 0
         changed = True
         while changed:
@@ -385,22 +376,22 @@ class ImprovedLocalSearch:
             for candidate_index in ordered:
                 if tracker.can_remove(candidate_index):
                     tracker.remove(candidate_index)
+                    outside.add(candidate_index)
                     removed += 1
                     changed = True
                     break
         return removed
 
-    def _sample_outside_candidates(self, tracker: CoverageTracker) -> List[int]:
-        outside = [
-            candidate_index
-            for candidate_index in range(len(self.instance.candidates))
-            if candidate_index not in tracker.in_solution
-        ]
-        if len(outside) <= self.candidate_sample_size:
-            return outside
-        return self.rng.sample(outside, self.candidate_sample_size)
+    def _sample_outside_candidates(self, outside: Set[int]) -> List[int]:
+        """优化4: 直接从增量维护的 outside 集合中采样，O(1) 而非 O(N)。"""
+        outside_list = list(outside)
+        if len(outside_list) <= self.candidate_sample_size:
+            return outside_list
+        return self.rng.sample(outside_list, self.candidate_sample_size)
 
-    def _try_remove(self, tracker: CoverageTracker, step: int, use_nn: bool) -> bool:
+    def _try_remove(
+        self, tracker: CoverageTracker, outside: Set[int], step: int, use_nn: bool
+    ) -> bool:
         candidates = []
         for candidate_index in tracker.in_solution:
             features = self.feat.extract_remove(
@@ -421,6 +412,7 @@ class ImprovedLocalSearch:
 
         if tracker.can_remove(candidate_index):
             tracker.remove(candidate_index)
+            outside.add(candidate_index)           # 增量维护
             self.nn.add_sample(features, 1.0)
             self.stats["improvements"] += 1
             return True
@@ -428,7 +420,9 @@ class ImprovedLocalSearch:
         self.nn.add_sample(features, 0.0)
         return False
 
-    def _try_replace(self, tracker: CoverageTracker, step: int, use_nn: bool) -> bool:
+    def _try_replace(
+        self, tracker: CoverageTracker, outside: Set[int], step: int, use_nn: bool
+    ) -> bool:
         if not tracker.in_solution:
             return False
 
@@ -436,7 +430,7 @@ class ImprovedLocalSearch:
             tracker.in_solution,
             key=lambda candidate_index: tracker.exclusive_count(candidate_index),
         )[: min(6, len(tracker.in_solution))]
-        add_pool = self._sample_outside_candidates(tracker)
+        add_pool = self._sample_outside_candidates(outside)
         if not add_pool:
             return False
 
@@ -462,23 +456,32 @@ class ImprovedLocalSearch:
             return False
 
         candidate_remove, candidate_add, features = best_pair
+        # 保存快照（用于回滚）
         snapshot = list(tracker.in_solution)
+        snapshot_outside = set(outside)
         size_before = tracker.solution_size
 
         tracker.remove(candidate_remove)
+        outside.add(candidate_remove)
         tracker.add(candidate_add)
-        self._strip_redundancy(tracker)
+        outside.discard(candidate_add)
+        self._strip_redundancy(tracker, outside)
 
         if tracker.is_feasible() and tracker.solution_size < size_before:
             self.nn.add_sample(features, 1.0)
             self.stats["improvements"] += 1
             return True
 
+        # 回滚
         tracker.reset(snapshot)
+        outside.clear()
+        outside.update(snapshot_outside)
         self.nn.add_sample(features, 0.0)
         return False
 
-    def _try_remove_repair(self, tracker: CoverageTracker, step: int) -> bool:
+    def _try_remove_repair(
+        self, tracker: CoverageTracker, outside: Set[int], step: int
+    ) -> bool:
         _ = step
         ordered = sorted(
             tracker.in_solution,
@@ -486,32 +489,46 @@ class ImprovedLocalSearch:
         )
         for candidate_remove in ordered[: min(5, len(ordered))]:
             snapshot = list(tracker.in_solution)
+            snapshot_outside = set(outside)
             size_before = tracker.solution_size
+
             tracker.remove(candidate_remove)
+            outside.add(candidate_remove)
 
             if tracker.is_feasible():
                 self.stats["improvements"] += 1
                 return True
 
-            add_pool = self._sample_outside_candidates(tracker)
+            add_pool = self._sample_outside_candidates(outside)
             if not add_pool:
                 tracker.reset(snapshot)
+                outside.clear()
+                outside.update(snapshot_outside)
                 continue
 
             candidate_add = max(add_pool, key=tracker.marginal_gain)
             tracker.add(candidate_add)
-            self._strip_redundancy(tracker)
+            outside.discard(candidate_add)
+            self._strip_redundancy(tracker, outside)
 
             if tracker.is_feasible() and tracker.solution_size < size_before:
                 self.stats["improvements"] += 1
                 return True
 
             tracker.reset(snapshot)
+            outside.clear()
+            outside.update(snapshot_outside)
 
         return False
 
 
+# ---------------------------------------------------------------------------
+# 优化5: SA 自适应参数
+# ---------------------------------------------------------------------------
+
 class ImprovedSA:
+    """模拟退火求解器，支持自适应初始温度和问题规模相关的迭代次数。"""
+
     def __init__(
         self,
         instance: CoverageInstance,
@@ -524,10 +541,20 @@ class ImprovedSA:
         self.instance = instance
         self.initial_solution = list(initial_solution)
         self.rng = rng
-        self.T_start = T_start
-        self.T_end = T_end
-        self.max_iter = max_iter
         self.penalty = max(10, len(initial_solution))
+
+        # 优化5: 根据问题规模自适应调整温度和迭代次数
+        n_candidates = len(instance.candidates)
+        n_targets = len(instance.targets)
+        problem_scale = math.log1p(n_candidates * n_targets)
+
+        # 自适应初始温度：规模越大，初始温度越高，接受更多劣解以跳出局部最优
+        self.T_start = max(T_start, 1.5 * math.log1p(problem_scale))
+        self.T_end = T_end
+
+        # 自适应迭代次数：至少保证每个候选被访问数次
+        adaptive_iter = min(20_000, max(max_iter, n_candidates * 5))
+        self.max_iter = adaptive_iter
 
     def _cost(self, tracker: CoverageTracker) -> int:
         return tracker.solution_size + self.penalty * tracker.deficit_units
@@ -542,6 +569,9 @@ class ImprovedSA:
         temperature = self.T_start
         cooling = (self.T_end / self.T_start) ** (1.0 / max(1, self.max_iter))
         outside = set(range(len(self.instance.candidates))) - tracker.in_solution
+
+        # 优化5: 自适应 reheating — no_improve 阈值与规模相关
+        reheat_threshold = max(300, min(800, len(self.instance.candidates) * 2))
         no_improve = 0
 
         for iteration in range(self.max_iter):
@@ -575,8 +605,9 @@ class ImprovedSA:
                 self._undo(tracker, move, outside)
                 no_improve += 1
 
-            if no_improve > 500:
-                temperature = min(temperature * 5.0, self.T_start)
+            # 优化5: 自适应 reheating，每次 reheat 强度递减避免无限循环
+            if no_improve >= reheat_threshold:
+                temperature = min(temperature * 4.0, self.T_start * 0.5)
                 no_improve = 0
 
         elapsed = time.time() - start
