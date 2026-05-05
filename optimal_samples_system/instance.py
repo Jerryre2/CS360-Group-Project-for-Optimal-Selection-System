@@ -63,9 +63,20 @@ class CoverageInstance:
         self._candidate_subset_cache: List[Optional[Tuple[int, ...]]] = [
             None
         ] * len(self.position_candidates)
+        self._candidate_subset_mask_cache: List[Optional[int]] = [
+            None
+        ] * len(self.position_candidates)
         self._candidate_impacted_targets_cache: List[Optional[Tuple[int, ...]]] = [
             None
         ] * len(self.position_candidates)
+
+        self.subset_to_candidates = [list() for _ in range(len(self.position_s_subsets))]
+        for candidate_index in range(len(self.position_candidates)):
+            for subset_id in self.candidate_subset_ids(candidate_index):
+                self.subset_to_candidates[subset_id].append(candidate_index)
+        self.subset_to_candidates = [
+            tuple(indices) for indices in self.subset_to_candidates
+        ]
 
         self.covers: Optional[List[Set[int]]] = None
         self.covered_by: Optional[List[Set[int]]] = None
@@ -132,6 +143,17 @@ class CoverageInstance:
         self._candidate_subset_cache[candidate_index] = subset_ids
         return subset_ids
 
+    def candidate_subset_mask(self, candidate_index: int) -> int:
+        cached = self._candidate_subset_mask_cache[candidate_index]
+        if cached is not None:
+            return cached
+
+        mask = 0
+        for subset_id in self.candidate_subset_ids(candidate_index):
+            mask |= 1 << subset_id
+        self._candidate_subset_mask_cache[candidate_index] = mask
+        return mask
+
     def candidate_impacted_targets(self, candidate_index: int) -> Tuple[int, ...]:
         cached = self._candidate_impacted_targets_cache[candidate_index]
         if cached is not None:
@@ -154,9 +176,10 @@ class CoverageInstance:
         return len(self.candidate_impacted_targets(candidate_index))
 
     def candidate_overlap_in_s_subsets(self, left_index: int, right_index: int) -> int:
-        left = set(self.candidate_subset_ids(left_index))
-        right = set(self.candidate_subset_ids(right_index))
-        return len(left & right)
+        return (
+            self.candidate_subset_mask(left_index)
+            & self.candidate_subset_mask(right_index)
+        ).bit_count()
 
     def candidate_label(self, candidate_index: int) -> Tuple[int, ...]:
         return self.candidates[candidate_index]

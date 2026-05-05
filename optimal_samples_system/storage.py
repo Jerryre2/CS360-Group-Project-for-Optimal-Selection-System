@@ -6,7 +6,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .config import AggregationMode, CoverageMode, LOGGER
 
@@ -52,6 +52,65 @@ class ResultDatabase:
             raise ValueError("Invalid database filename.")
         return path
 
+    def _validation_snapshot(self, data: Dict[str, object]) -> Dict[str, object]:
+        validation = data.get("validation")
+        if not isinstance(validation, dict):
+            return {
+                "status": "unverified",
+                "summary": "validation=unverified",
+            }
+
+        primary_valid = bool(validation.get("primary_valid"))
+        independent_valid = bool(validation.get("independent_valid"))
+        methods_agree = bool(validation.get("methods_agree"))
+        unsatisfied_targets = validation.get("unsatisfied_targets")
+        deficit_units = validation.get("deficit_units")
+
+        if not methods_agree:
+            status = "mismatch"
+        elif primary_valid and independent_valid:
+            status = "validated"
+        else:
+            status = "invalid"
+
+        tail_parts = []
+        if unsatisfied_targets is not None:
+            tail_parts.append(f"unsat={unsatisfied_targets}")
+        if deficit_units is not None:
+            tail_parts.append(f"deficit={deficit_units}")
+        tail = f" ({', '.join(tail_parts)})" if tail_parts else ""
+
+        return {
+            "status": status,
+            "primary_valid": primary_valid,
+            "independent_valid": independent_valid,
+            "methods_agree": methods_agree,
+            "unsatisfied_targets": unsatisfied_targets,
+            "deficit_units": deficit_units,
+            "summary": (
+                f"validation={status}, primary={primary_valid}, "
+                f"independent={independent_valid}, agree={methods_agree}{tail}"
+            ),
+        }
+
+    def _result_header_lines(self, filename: str, data: Dict[str, object]) -> List[str]:
+        validation = self._validation_snapshot(data)
+        exact_size = data.get("exact_size")
+        lines = [
+            f"File: {filename}",
+            (
+                f"Size: {data.get('num_groups')} | "
+                f"{data.get('coverage_mode') or data.get('params', {}).get('coverage_mode')} / "
+                f"{data.get('aggregation_mode') or data.get('params', {}).get('aggregation_mode')}"
+                + (f" | exact={exact_size}" if exact_size is not None else "")
+            ),
+            f"Validation: {validation['summary']}",
+        ]
+        timestamp = data.get("timestamp")
+        if timestamp is not None:
+            lines.append(f"Timestamp: {timestamp}")
+        return lines
+
     def save(self, result: Dict[str, object]) -> Path:
         params = dict(result["params"])
         prefix = self._prefix(params)
@@ -84,6 +143,7 @@ class ResultDatabase:
                     or data.get("params", {}).get("aggregation_mode"),
                     "timestamp": data.get("timestamp"),
                     "exact_size": data.get("exact_size"),
+                    "validation_status": self._validation_snapshot(data)["status"],
                 }
             )
         return items
@@ -103,6 +163,7 @@ class ResultDatabase:
             LOGGER.info(
                 f"{item['filename']} | size={item['num_groups']} | "
                 f"{item['coverage_mode']} / {item['aggregation_mode']}{exact} | "
+                f"validation={item['validation_status']} | "
                 f"{item['timestamp']}"
             )
 
@@ -120,4 +181,6 @@ class ResultDatabase:
 
     def print_result(self, filename: str) -> None:
         data = self.load(filename)
+        for line in self._result_header_lines(filename, data):
+            LOGGER.info(line)
         LOGGER.info(json.dumps(data, indent=2, ensure_ascii=False))

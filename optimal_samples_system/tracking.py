@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, Set, Tuple
 
 from .config import AggregationMode
 from .instance import CoverageInstance
@@ -13,6 +12,8 @@ class CoverageTracker:
     def __init__(self, instance: CoverageInstance):
         self.instance = instance
         self.in_solution: Set[int] = set()
+        self._state_version = 0
+        self._removal_losses_cache: Dict[int, Tuple[int, Dict[int, int]]] = {}
 
         if instance.aggregation_mode == AggregationMode.DISTINCT_SUBSETS:
             self.subset_cover_count = [0] * len(instance.s_subsets)
@@ -26,6 +27,7 @@ class CoverageTracker:
 
     def reset(self, solution_indices: Iterable[int]) -> None:
         self.in_solution = set()
+        self._state_version += 1
         if self.instance.aggregation_mode == AggregationMode.DISTINCT_SUBSETS:
             self.subset_cover_count = [0] * len(self.instance.s_subsets)
             self.target_covered_count = [0] * len(self.instance.targets)
@@ -46,6 +48,7 @@ class CoverageTracker:
             return
 
         self.in_solution.add(candidate_index)
+        self._state_version += 1
         if self.instance.aggregation_mode == AggregationMode.DISTINCT_SUBSETS:
             for subset_id in self.instance.candidate_subset_ids(candidate_index):
                 if self.subset_cover_count[subset_id] == 0:
@@ -73,6 +76,7 @@ class CoverageTracker:
             return
 
         self.in_solution.remove(candidate_index)
+        self._state_version += 1
         if self.instance.aggregation_mode == AggregationMode.DISTINCT_SUBSETS:
             for subset_id in self.instance.candidate_subset_ids(candidate_index):
                 self.subset_cover_count[subset_id] -= 1
@@ -117,15 +121,21 @@ class CoverageTracker:
                 if self.cover_count[target_index] == 0
             )
 
-        target_gain: Dict[int, int] = defaultdict(int)
+        target_gain: Dict[int, int] = {}
         gain = 0
+        subset_cover_count = self.subset_cover_count
+        target_covered_count = self.target_covered_count
+        required_subset_count = self.instance.required_subset_count
         for subset_id in self.instance.candidate_subset_ids(candidate_index):
-            if self.subset_cover_count[subset_id] > 0:
+            if subset_cover_count[subset_id] > 0:
                 continue
             for target_index in self.instance.subset_to_targets[subset_id]:
-                deficit = self.target_deficit(target_index)
-                if target_gain[target_index] < deficit:
-                    target_gain[target_index] += 1
+                deficit = required_subset_count - target_covered_count[target_index]
+                if deficit <= 0:
+                    continue
+                current_gain = target_gain.get(target_index, 0)
+                if current_gain < deficit:
+                    target_gain[target_index] = current_gain + 1
                     gain += 1
         return gain
 
@@ -140,20 +150,26 @@ class CoverageTracker:
         )
 
     def _removal_losses(self, candidate_index: int) -> Dict[int, int]:
-        losses: Dict[int, int] = defaultdict(int)
+        cached = self._removal_losses_cache.get(candidate_index)
+        if cached is not None and cached[0] == self._state_version:
+            return cached[1]
+
+        losses: Dict[int, int] = {}
         if self.instance.aggregation_mode == AggregationMode.SINGLE_CANDIDATE:
             if self.instance.covers is None:
                 raise RuntimeError("Single-candidate cover relation was not built.")
             for target_index in self.instance.covers[candidate_index]:
                 if self.cover_count[target_index] == 1:
                     losses[target_index] = 1
+            self._removal_losses_cache[candidate_index] = (self._state_version, losses)
             return losses
 
         for subset_id in self.instance.candidate_subset_ids(candidate_index):
             if self.subset_cover_count[subset_id] != 1:
                 continue
             for target_index in self.instance.subset_to_targets[subset_id]:
-                losses[target_index] += 1
+                losses[target_index] = losses.get(target_index, 0) + 1
+        self._removal_losses_cache[candidate_index] = (self._state_version, losses)
         return losses
 
     def can_remove(self, candidate_index: int) -> bool:
@@ -202,11 +218,11 @@ class CoverageTracker:
                 impacted
             )
 
-        surplus = [
+        total_surplus = sum(
             self.target_covered_count[target_index] - self.instance.required_subset_count
             for target_index in impacted
-        ]
-        return sum(surplus) / len(surplus)
+        )
+        return total_surplus / len(impacted)
 
     def get_newly_uncovered(self, candidate_index: int) -> Set[int]:
         losses = self._removal_losses(candidate_index)

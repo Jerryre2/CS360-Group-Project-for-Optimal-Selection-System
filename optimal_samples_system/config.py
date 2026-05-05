@@ -128,23 +128,121 @@ class ProblemConfig:
 
 @dataclass
 class SolverConfig:
-    n_restarts: int = 3
+    n_restarts: int = 5
+    elite_pool_size: int = 4
+    elite_guided_restarts: bool = True
+    path_relinking: bool = True
     use_ilp: bool = True
+    exact_backend: str = "auto"
+    exact_time_limit: int = 60
+    force_exact: bool = False
+    mid_size_exact_improvement: bool = False
+    mid_size_exact_candidate_threshold: int = 12000
+    mid_size_exact_time_limit: int = 20
+    local_branching_improvement: bool = False
+    local_branching_candidate_threshold: int = 14000
+    local_branching_time_limit: int = 8
+    local_branching_base_radius: int = 12
+    local_branching_rounds: int = 2
+    lp_guided_exact_polish: bool = True
+    lp_guided_candidate_threshold: int = 18000
+    lp_guided_time_limit: int = 4
+    lp_guided_core_cap: int = 900
+    lp_guided_rounds: int = 1
+    cluster_exact_repair: bool = True
+    cluster_exact_candidate_threshold: int = 22000
+    cluster_exact_time_limit: int = 4
+    cluster_exact_core_cap: int = 1200
+    cluster_exact_rounds: int = 1
+    cluster_exact_destroy_size: int = 10
+    ruin_recreate_exact: bool = False
+    ruin_recreate_candidate_threshold: int = 30000
+    ruin_recreate_rounds: int = 2
+    ruin_recreate_destroy_size: int = 18
+    ruin_recreate_core_cap: int = 2400
+    ruin_recreate_time_limit: int = 10
+    elite_union_exact_polish: bool = False
+    elite_union_candidate_threshold: int = 18000
+    elite_union_core_cap: int = 2400
+    elite_union_time_limit: int = 8
+    cardinality_descent: bool = False
+    cardinality_descent_candidate_threshold: int = 15000
+    cardinality_descent_iterations: int = 900
+    cardinality_descent_patience: int = 180
+    cardinality_descent_sample_size: int = 48
+    cardinality_descent_initial_drop: int = 2
+    cardinality_descent_max_rounds: int = 3
     max_local_steps: Optional[int] = None
     max_sa_iterations: Optional[int] = None
     candidate_sample_size: int = 48
-    use_neural_guidance: bool = True
+    large_instance_candidate_threshold: int = 20000
+    large_instance_min_local_steps: int = 160
+    large_instance_min_sa_iterations: int = 220
+    adaptive_neighborhoods: bool = True
+    reduced_exact_polish: bool = True
+    reduced_exact_time_limit: int = 4
+    reduced_exact_core_cap: int = 192
+    reduced_exact_rounds: int = 1
     save_result: bool = False
     db_dir: str = "results_db_v3"
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "n_restarts": self.n_restarts,
+            "elite_pool_size": self.elite_pool_size,
+            "elite_guided_restarts": self.elite_guided_restarts,
+            "path_relinking": self.path_relinking,
             "use_ilp": self.use_ilp,
+            "exact_backend": self.exact_backend,
+            "exact_time_limit": self.exact_time_limit,
+            "force_exact": self.force_exact,
+            "mid_size_exact_improvement": self.mid_size_exact_improvement,
+            "mid_size_exact_candidate_threshold": self.mid_size_exact_candidate_threshold,
+            "mid_size_exact_time_limit": self.mid_size_exact_time_limit,
+            "local_branching_improvement": self.local_branching_improvement,
+            "local_branching_candidate_threshold": self.local_branching_candidate_threshold,
+            "local_branching_time_limit": self.local_branching_time_limit,
+            "local_branching_base_radius": self.local_branching_base_radius,
+            "local_branching_rounds": self.local_branching_rounds,
+            "lp_guided_exact_polish": self.lp_guided_exact_polish,
+            "lp_guided_candidate_threshold": self.lp_guided_candidate_threshold,
+            "lp_guided_time_limit": self.lp_guided_time_limit,
+            "lp_guided_core_cap": self.lp_guided_core_cap,
+            "lp_guided_rounds": self.lp_guided_rounds,
+            "cluster_exact_repair": self.cluster_exact_repair,
+            "cluster_exact_candidate_threshold": self.cluster_exact_candidate_threshold,
+            "cluster_exact_time_limit": self.cluster_exact_time_limit,
+            "cluster_exact_core_cap": self.cluster_exact_core_cap,
+            "cluster_exact_rounds": self.cluster_exact_rounds,
+            "cluster_exact_destroy_size": self.cluster_exact_destroy_size,
+            "ruin_recreate_exact": self.ruin_recreate_exact,
+            "ruin_recreate_candidate_threshold": self.ruin_recreate_candidate_threshold,
+            "ruin_recreate_rounds": self.ruin_recreate_rounds,
+            "ruin_recreate_destroy_size": self.ruin_recreate_destroy_size,
+            "ruin_recreate_core_cap": self.ruin_recreate_core_cap,
+            "ruin_recreate_time_limit": self.ruin_recreate_time_limit,
+            "elite_union_exact_polish": self.elite_union_exact_polish,
+            "elite_union_candidate_threshold": self.elite_union_candidate_threshold,
+            "elite_union_core_cap": self.elite_union_core_cap,
+            "elite_union_time_limit": self.elite_union_time_limit,
+            "cardinality_descent": self.cardinality_descent,
+            "cardinality_descent_candidate_threshold": self.cardinality_descent_candidate_threshold,
+            "cardinality_descent_iterations": self.cardinality_descent_iterations,
+            "cardinality_descent_patience": self.cardinality_descent_patience,
+            "cardinality_descent_sample_size": self.cardinality_descent_sample_size,
+            "cardinality_descent_initial_drop": self.cardinality_descent_initial_drop,
+            "cardinality_descent_max_rounds": self.cardinality_descent_max_rounds,
             "max_local_steps": self.max_local_steps,
             "max_sa_iterations": self.max_sa_iterations,
             "candidate_sample_size": self.candidate_sample_size,
-            "use_neural_guidance": self.use_neural_guidance,
+            "large_instance_candidate_threshold": self.large_instance_candidate_threshold,
+            "large_instance_min_local_steps": self.large_instance_min_local_steps,
+            "large_instance_min_sa_iterations": self.large_instance_min_sa_iterations,
+            "adaptive_neighborhoods": self.adaptive_neighborhoods,
+            "reduced_exact_polish": self.reduced_exact_polish,
+            "reduced_exact_time_limit": self.reduced_exact_time_limit,
+            "reduced_exact_core_cap": self.reduced_exact_core_cap,
+            "reduced_exact_rounds": self.reduced_exact_rounds,
             "save_result": self.save_result,
             "db_dir": self.db_dir,
         }
@@ -167,6 +265,7 @@ class SolveResult:
     num_candidates: int
     aggregation_mode: str
     coverage_mode: str
+    validation: Optional[Dict[str, object]] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -185,4 +284,5 @@ class SolveResult:
             "num_candidates": self.num_candidates,
             "aggregation_mode": self.aggregation_mode,
             "coverage_mode": self.coverage_mode,
+            "validation": self.validation,
         }
